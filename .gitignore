@@ -1,0 +1,30 @@
+# Build
+/target
+/dist
+/build
+
+# Dependencies
+/node_modules
+/python-workers/__pycache__
+/python-workers/*.pyc
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Tauri
+src-tauri/target
+
+# Models (large files)
+/models/*.onnx
+/models/*.bin
