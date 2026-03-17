@@ -1,71 +1,96 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use crate::commands::{AppConfig, SearchResult, IndexStatus};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::commands::{AppConfig, SearchResult};
 use crate::python_worker::PythonWorkerManager;
 use log::{info, error, warn};
 use serde_json::json;
 use walkdir::WalkDir;
-use std::path::Path;
 use chrono::Utc;
 
 /// 应用状态
 pub struct AppState {
     config: AppConfig,
+    config_path: PathBuf,
     worker_manager: Arc<PythonWorkerManager>,
-    is_indexing: Arc<Mutex<bool>>,
-    indexed_files: Arc<Mutex<usize>>,
-    last_update: Arc<Mutex<Option<String>>>,
+    is_indexing: Arc<AtomicBool>,
+    indexed_files: Arc<AtomicUsize>,
+    index_target: Arc<AtomicUsize>,
+    last_update: Arc<StdMutex<Option<String>>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let worker_manager = Arc::new(PythonWorkerManager::new("python-workers"));
+        let (worker_dir, model_dir, index_dir) = PythonWorkerManager::project_paths();
+        let worker_manager = Arc::new(PythonWorkerManager::new(worker_dir, model_dir, index_dir));
+        let config_path = default_config_path();
         
         // 初始化 workers
         if let Err(e) = worker_manager.init_workers() {
             error!("Failed to initialize Python workers: {}", e);
         }
 
+        let config = load_config(&config_path);
+        let indexed_files = Arc::new(AtomicUsize::new(0));
+        let index_target = Arc::new(AtomicUsize::new(0));
+        let last_update = Arc::new(StdMutex::new(None));
+
+        if let Ok(stats) = worker_manager.get_index_stats() {
+            if let Some(count) = stats.get("indexed_files").and_then(|v| v.as_u64()) {
+                indexed_files.store(count as usize, Ordering::Relaxed);
+            }
+        }
+
         Self {
-            config: AppConfig {
-                default_directory: None,
-                excluded_dirs: vec![
-                    ".git".to_string(),
-                    "node_modules".to_string(),
-                    ".DS_Store".to_string(),
-                    "__pycache__".to_string(),
-                    "target".to_string(),
-                ],
-                top_k: 10,
-                threshold: 0.5,
-                file_types: vec![],
-            },
+            config,
+            config_path,
             worker_manager,
-            is_indexing: Arc::new(Mutex::new(false)),
-            indexed_files: Arc::new(Mutex::new(0)),
-            last_update: Arc::new(Mutex::new(None)),
+            is_indexing: Arc::new(AtomicBool::new(false)),
+            indexed_files,
+            index_target,
+            last_update,
         }
     }
 
     /// 搜索文件
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+    pub async fn search(
+        &self,
+        query: &str,
+        top_k: Option<usize>,
+        threshold: Option<f32>,
+        file_types: Option<&[String]>,
+        directory: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         info!("Searching for: {}", query);
+
+        if self.indexed_files.load(Ordering::Relaxed) == 0 {
+            return Ok(Vec::new());
+        }
         
         // 1. 向量化查询
         let query_embedding = self.worker_manager.encode_text(query, true)?;
         
         // 2. 搜索相似文件
-        let raw_results = self.worker_manager.search(&query_embedding, self.config.top_k)?;
+        let raw_results = self.worker_manager.search(&query_embedding, top_k.unwrap_or(self.config.top_k))?;
+        let threshold = threshold.unwrap_or(self.config.threshold);
+        let file_types = file_types.unwrap_or(&self.config.file_types);
         
         // 3. 转换为 SearchResult
         let mut results: Vec<SearchResult> = raw_results.iter()
             .filter_map(|r| {
                 let path = r.get("path")?.as_str()?.to_string();
                 let score = r.get("score")?.as_f64()? as f32;
+
+                if let Some(directory) = directory {
+                    if !path.starts_with(directory) {
+                        return None;
+                    }
+                }
                 
                 // 过滤低于阈值的结果
-                if score < self.config.threshold {
+                if score < threshold {
                     return None;
                 }
                 
@@ -76,6 +101,17 @@ impl AppState {
                     .and_then(|e| e.to_str())
                     .unwrap_or("unknown")
                     .to_string();
+
+                if !file_types.is_empty() {
+                    let normalized_file_type = format!(".{}", file_type.to_lowercase());
+                    let matches = file_types.iter().any(|t| {
+                        let normalized = t.trim().to_lowercase();
+                        normalized == normalized_file_type || normalized == file_type.to_lowercase()
+                    });
+                    if !matches {
+                        return None;
+                    }
+                }
                 
                 // 读取文件内容摘要（前 200 字）
                 let summary = if let Ok(content) = std::fs::read_to_string(&path) {
@@ -115,23 +151,35 @@ impl AppState {
     /// 开始索引目录
     pub async fn start_indexing(&self, directory: &str) -> Result<()> {
         info!("Starting indexing for: {}", directory);
-        
-        let mut is_indexing = self.is_indexing.lock().await;
-        *is_indexing = true;
+
+        if self.is_indexing.swap(true, Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Indexing is already in progress"));
+        }
+
+        self.indexed_files.store(0, Ordering::Relaxed);
+        self.index_target.store(0, Ordering::Relaxed);
+        self.is_indexing.store(true, Ordering::Relaxed);
+
+        self.worker_manager.reset_index()?;
         
         let worker_manager = self.worker_manager.clone();
         let directory = directory.to_string();
         let excluded_dirs = self.config.excluded_dirs.clone();
+        let file_types = self.config.file_types.clone();
         let indexed_files = self.indexed_files.clone();
+        let index_target = self.index_target.clone();
         let last_update = self.last_update.clone();
+        let is_indexing = self.is_indexing.clone();
         
         // 在后台执行索引
         tokio::spawn(async move {
             let result = index_directory(
                 &directory,
                 &excluded_dirs,
+                &file_types,
                 &worker_manager,
                 &indexed_files,
+                &index_target,
                 &last_update,
             ).await;
             
@@ -139,35 +187,36 @@ impl AppState {
                 error!("Indexing failed: {}", e);
             }
             
-            let mut is_indexing = is_indexing.lock().await;
-            *is_indexing = false;
+            is_indexing.store(false, Ordering::Relaxed);
         });
         
         Ok(())
     }
 
     pub fn is_indexing(&self) -> bool {
-        // 这里需要异步获取，简化处理
-        false
+        self.is_indexing.load(Ordering::Relaxed)
     }
 
     pub fn get_indexed_count(&self) -> usize {
-        // 简化处理
-        0
+        self.indexed_files.load(Ordering::Relaxed)
+    }
+
+    pub fn get_index_target(&self) -> usize {
+        self.index_target.load(Ordering::Relaxed)
     }
 
     pub fn get_last_update(&self) -> Option<String> {
-        // 简化处理
-        None
+        self.last_update.lock().ok().and_then(|value| value.clone())
     }
 
     pub fn get_index_size(&self) -> f64 {
-        // 简化处理
-        0.0
+        let (_, _, index_dir) = PythonWorkerManager::project_paths();
+        directory_size_mb(&index_dir)
     }
 
-    pub fn update_config(&mut self, config: AppConfig) {
+    pub fn update_config(&mut self, config: AppConfig) -> Result<()> {
         self.config = config;
+        save_config(&self.config_path, &self.config)
     }
 
     pub fn get_config(&self) -> &AppConfig {
@@ -179,9 +228,11 @@ impl AppState {
 async fn index_directory(
     directory: &str,
     excluded_dirs: &[String],
+    file_types: &[String],
     worker_manager: &Arc<PythonWorkerManager>,
-    indexed_files: &Arc<Mutex<usize>>,
-    last_update: &Arc<Mutex<Option<String>>>,
+    indexed_files: &Arc<AtomicUsize>,
+    index_target: &Arc<AtomicUsize>,
+    last_update: &Arc<StdMutex<Option<String>>>,
 ) -> Result<()> {
     info!("Indexing directory: {}", directory);
     
@@ -214,6 +265,18 @@ async fn index_directory(
         }
         
         let path = entry.path();
+        if !file_types.is_empty() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            let normalized_ext = format!(".{}", ext);
+            let matches = file_types.iter().any(|t| {
+                let normalized = t.trim().to_lowercase();
+                normalized == normalized_ext || normalized == ext
+            });
+            if !matches {
+                continue;
+            }
+        }
+
         let path_str = match path.to_str() {
             Some(s) => s.to_string(),
             None => continue,
@@ -223,6 +286,7 @@ async fn index_directory(
     }
     
     info!("Found {} files to index", files_to_index.len());
+    index_target.store(files_to_index.len(), Ordering::Relaxed);
     
     // 2. 批量处理文件（每批 10 个）
     let mut total_indexed = 0;
@@ -258,18 +322,15 @@ async fn index_directory(
                 error!("Failed to index batch: {}", e);
             }
         }
+
+        indexed_files.store(total_indexed, Ordering::Relaxed);
         
         info!("Indexed {} files so far", total_indexed);
     }
     
     // 更新状态
-    {
-        let mut count = indexed_files.lock().await;
-        *count = total_indexed;
-    }
-    
-    {
-        let mut update = last_update.lock().await;
+    indexed_files.store(total_indexed, Ordering::Relaxed);
+    if let Ok(mut update) = last_update.lock() {
         *update = Some(Utc::now().to_rfc3339());
     }
     
@@ -281,4 +342,52 @@ impl Default for AppState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn default_config() -> AppConfig {
+    AppConfig {
+        default_directory: None,
+        excluded_dirs: vec![
+            ".git".to_string(),
+            "node_modules".to_string(),
+            ".DS_Store".to_string(),
+            "__pycache__".to_string(),
+            "target".to_string(),
+        ],
+        top_k: 10,
+        threshold: 0.5,
+        file_types: vec![],
+    }
+}
+
+fn default_config_path() -> PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("semantic-file-finder");
+    path.push("config.json");
+    path
+}
+
+fn load_config(path: &Path) -> AppConfig {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| default_config()),
+        Err(_) => default_config(),
+    }
+}
+
+fn save_config(path: &Path, config: &AppConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    Ok(())
+}
+
+fn directory_size_mb(path: &Path) -> f64 {
+    let total_bytes: u64 = WalkDir::new(path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    total_bytes as f64 / 1024.0 / 1024.0
 }

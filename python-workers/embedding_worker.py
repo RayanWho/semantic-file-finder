@@ -14,7 +14,6 @@ from pathlib import Path
 try:
     import onnxruntime as ort
     from transformers import AutoTokenizer
-    import torch
 except ImportError as e:
     print(json.dumps({"error": f"Missing dependency: {e}"}))
     sys.exit(1)
@@ -41,16 +40,16 @@ class EmbeddingModel:
         """加载模型"""
         try:
             logger.info(f"Loading model from {self.model_path}")
-            
+
+            model_base = self.model_path
+            if not (model_base / "tokenizer.json").exists() and (model_base / "onnx").exists():
+                model_base = model_base / "onnx"
+
             # 加载 tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            
+            self.tokenizer = AutoTokenizer.from_pretrained(model_base)
+
             # 加载 ONNX 模型
-            onnx_path = self.model_path / "onnx" / "model.onnx"
-            if not onnx_path.exists():
-                # 尝试其他路径
-                onnx_path = self.model_path / "model.onnx"
-            
+            onnx_path = model_base / "model.onnx"
             if not onnx_path.exists():
                 raise FileNotFoundError(f"ONNX model not found at {onnx_path}")
             
@@ -90,12 +89,12 @@ class EmbeddingModel:
                 padding=True,
                 truncation=True,
                 max_length=self.max_length,
-                return_tensors="pt"
+                return_tensors="np"
             )
             
             # 准备输入
-            input_ids = inputs["input_ids"].numpy()
-            attention_mask = inputs["attention_mask"].numpy()
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
             
             # 推理
             ort_inputs = {
@@ -105,7 +104,7 @@ class EmbeddingModel:
             
             # 如果有 token_type_ids
             if "token_type_ids" in inputs:
-                ort_inputs["token_type_ids"] = inputs["token_type_ids"].numpy()
+                ort_inputs["token_type_ids"] = inputs["token_type_ids"]
             
             # 运行推理
             outputs = self.session.run(None, ort_inputs)

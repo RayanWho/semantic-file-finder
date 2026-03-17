@@ -1,4 +1,4 @@
-import React, { useState, FormEvent } from 'react';
+import React, { useState, FormEvent, useEffect } from 'react';
 
 interface SearchBoxProps {
   onSearch: (query: string) => void;
@@ -8,6 +8,10 @@ interface SearchBoxProps {
 
 export function SearchBox({ onSearch, loading, initialValue = '' }: SearchBoxProps) {
   const [query, setQuery] = useState(initialValue);
+
+  useEffect(() => {
+    setQuery(initialValue);
+  }, [initialValue]);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();

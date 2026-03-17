@@ -3,31 +3,36 @@ use serde_json::{json, Value};
 use std::process::{Command, Stdio, Child, ChildStdin, ChildStdout};
 use std::io::{Write, BufRead, BufReader};
 use std::sync::Mutex;
-use log::{info, error, warn};
+use std::path::{Path, PathBuf};
+use log::info;
 
 /// Python Worker 管理器
 pub struct PythonWorkerManager {
     embedding_worker: Mutex<Option<WorkerProcess>>,
     parser_worker: Mutex<Option<WorkerProcess>>,
     indexer_worker: Mutex<Option<WorkerProcess>>,
-    worker_dir: String,
+    worker_dir: PathBuf,
+    model_dir: PathBuf,
+    index_dir: PathBuf,
 }
 
 /// Worker 进程封装
 pub struct WorkerProcess {
-    process: Child,
+    _process: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl PythonWorkerManager {
     /// 创建新的 Worker 管理器
-    pub fn new(worker_dir: &str) -> Self {
+    pub fn new(worker_dir: impl Into<PathBuf>, model_dir: impl Into<PathBuf>, index_dir: impl Into<PathBuf>) -> Self {
         Self {
             embedding_worker: Mutex::new(None),
             parser_worker: Mutex::new(None),
             indexer_worker: Mutex::new(None),
-            worker_dir: worker_dir.to_string(),
+            worker_dir: worker_dir.into(),
+            model_dir: model_dir.into(),
+            index_dir: index_dir.into(),
         }
     }
 
@@ -55,7 +60,7 @@ impl PythonWorkerManager {
         // 发送初始化命令
         let request = json!({
             "action": "init",
-            "model_path": "models"
+            "model_path": self.model_dir.display().to_string()
         });
         self.send_request(&mut worker, &request)?;
         
@@ -83,12 +88,12 @@ impl PythonWorkerManager {
 
     /// 启动 Indexer Worker
     fn start_indexer_worker(&self) -> Result<()> {
-        let mut worker = self.start_worker("indexer_worker.py")?;
+        let mut worker = self.start_worker("indexer_worker_usearch.py")?;
         
         // 发送初始化命令
         let request = json!({
             "action": "init",
-            "index_dir": "index"
+            "index_dir": self.index_dir.display().to_string()
         });
         self.send_request(&mut worker, &request)?;
         
@@ -105,8 +110,11 @@ impl PythonWorkerManager {
 
     /// 启动通用 Worker 进程
     fn start_worker(&self, worker_name: &str) -> Result<WorkerProcess> {
-        let worker_path = std::path::Path::new(&self.worker_dir).join(worker_name);
-        
+        let worker_path = self.worker_dir.join(worker_name);
+        if !worker_path.exists() {
+            return Err(anyhow::anyhow!("Worker script not found: {}", worker_path.display()));
+        }
+
         let mut process = Command::new("python3")
             .arg(&worker_path)
             .stdin(Stdio::piped())
@@ -122,7 +130,7 @@ impl PythonWorkerManager {
         let stdout_reader = BufReader::new(stdout);
 
         Ok(WorkerProcess {
-            process,
+            _process: process,
             stdin,
             stdout: stdout_reader,
         })
@@ -151,6 +159,16 @@ impl PythonWorkerManager {
         Ok(response)
     }
 
+    pub fn project_paths() -> (PathBuf, PathBuf, PathBuf) {
+        let tauri_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let project_root = tauri_dir.parent().unwrap_or(tauri_dir);
+        (
+            project_root.join("python-workers"),
+            project_root.join("models"),
+            project_root.join("index"),
+        )
+    }
+
     /// 编码文本（单个）
     pub fn encode_text(&self, text: &str, is_query: bool) -> Result<Vec<f32>> {
         let request = json!({
@@ -175,6 +193,7 @@ impl PythonWorkerManager {
     }
 
     /// 批量编码文本
+    #[allow(dead_code)]
     pub fn encode_texts(&self, texts: &[String], is_query: bool) -> Result<Vec<Vec<f32>>> {
         let request = json!({
             "action": "encode",
@@ -296,18 +315,34 @@ impl PythonWorkerManager {
         self.receive_response(worker)
     }
 
+    pub fn reset_index(&self) -> Result<Value> {
+        let request = json!({
+            "action": "reset"
+        });
+
+        let mut indexer = self.indexer_worker.lock().unwrap();
+        let worker = indexer.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Indexer worker not initialized"))?;
+
+        self.send_request(worker, &request)?;
+        self.receive_response(worker)
+    }
+
     /// 关闭所有 Workers
     pub fn shutdown(&self) {
         info!("Shutting down Python workers...");
         
-        let workers = [
-            ("embedding", self.embedding_worker.lock().unwrap().as_mut()),
-            ("parser", self.parser_worker.lock().unwrap().as_mut()),
-            ("indexer", self.indexer_worker.lock().unwrap().as_mut()),
-        ];
-
-        for (name, worker_opt) in workers.iter() {
-            if let Some(worker) = worker_opt {
+        let worker_names = ["embedding", "parser", "indexer"];
+        
+        for name in worker_names.iter() {
+            let mut worker_guard = match *name {
+                "embedding" => self.embedding_worker.lock().unwrap(),
+                "parser" => self.parser_worker.lock().unwrap(),
+                "indexer" => self.indexer_worker.lock().unwrap(),
+                _ => continue,
+            };
+            
+            if let Some(worker) = worker_guard.as_mut() {
                 let quit_request = json!({"action": "quit"});
                 if let Ok(_) = self.send_request(worker, &quit_request) {
                     info!("{} worker shutdown", name);

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use std::sync::Arc;
+use std::process::{Command, Stdio};
 use tokio::sync::Mutex;
+use tauri_plugin_dialog::DialogExt;
 use crate::state::AppState;
 
 /// 搜索请求
@@ -38,8 +40,10 @@ pub struct SearchResponse {
 pub struct IndexStatus {
     pub is_indexing: bool,
     pub indexed_files: usize,
+    pub indexed_target: usize,
     pub last_update: Option<String>,
     pub index_size_mb: f64,
+    pub default_directory: Option<String>,
 }
 
 /// 配置
@@ -61,13 +65,21 @@ pub async fn search_files(
     let state = state.lock().await;
     
     // 调用搜索逻辑
-    let results = state.search(&request.query)
+    let results: Vec<SearchResult> = state.search(
+        &request.query,
+        request.top_k,
+        request.threshold,
+        request.file_types.as_deref(),
+        request.directory.as_deref(),
+    )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e: anyhow::Error| e.to_string())?;
+    
+    let total = results.len();
     
     Ok(SearchResponse {
         results,
-        total: results.len(),
+        total,
         query_time_ms: 0, // TODO: 实际计算
     })
 }
@@ -78,7 +90,7 @@ pub async fn start_indexing(
     directory: String,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let mut state = state.lock().await;
+    let state = state.lock().await;
     
     state.start_indexing(&directory)
         .await
@@ -95,8 +107,10 @@ pub async fn get_index_status(
     Ok(IndexStatus {
         is_indexing: state.is_indexing(),
         indexed_files: state.get_indexed_count(),
+        indexed_target: state.get_index_target(),
         last_update: state.get_last_update(),
         index_size_mb: state.get_index_size(),
+        default_directory: state.get_config().default_directory.clone(),
     })
 }
 
@@ -107,8 +121,7 @@ pub async fn update_config(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
     let mut state = state.lock().await;
-    state.update_config(config);
-    Ok(())
+    state.update_config(config).map_err(|e| e.to_string())
 }
 
 /// 获取配置
@@ -122,9 +135,17 @@ pub async fn get_config(
 
 /// 选择目录
 #[tauri::command]
-pub async fn select_directory() -> Result<Option<String>, String> {
-    // TODO: 使用 tauri-plugin-dialog
-    Ok(None)
+pub async fn select_directory(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    let selected = app_handle.dialog().file().blocking_pick_folder();
+    match selected {
+        Some(path) => Ok(Some(
+            path.into_path()
+                .map_err(|e| e.to_string())?
+                .display()
+                .to_string(),
+        )),
+        None => Ok(None),
+    }
 }
 
 /// 打开文件
@@ -136,7 +157,61 @@ pub async fn open_file(path: String) -> Result<(), String> {
 
 /// 复制路径
 #[tauri::command]
-pub async fn copy_path(path: String, app_handle: tauri::AppHandle) -> Result<(), String> {
-    // TODO: 复制到剪贴板
-    Ok(())
+pub async fn copy_path(path: String, _app_handle: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        use std::io::Write;
+        child.stdin.as_mut()
+            .ok_or_else(|| "Failed to open clipboard stdin".to_string())?
+            .write_all(path.as_bytes())
+            .map_err(|e| e.to_string())?;
+        child.wait().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        use std::io::Write;
+        child.stdin.as_mut()
+            .ok_or_else(|| "Failed to open clipboard stdin".to_string())?
+            .write_all(path.as_bytes())
+            .map_err(|e| e.to_string())?;
+        if child.wait().map_err(|e| e.to_string())?.success() {
+            return Ok(());
+        }
+        return Err("Failed to copy path".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let candidates = [("wl-copy", vec![]), ("xclip", vec!["-selection", "clipboard"])];
+        for (program, args) in candidates {
+            if let Ok(mut child) = Command::new(program)
+                .args(args)
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(path.as_bytes()).map_err(|e| e.to_string())?;
+                }
+                let status = child.wait().map_err(|e| e.to_string())?;
+                if status.success() {
+                    return Ok(());
+                }
+            }
+        }
+        return Err("Failed to copy path: wl-copy/xclip unavailable".to_string());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Clipboard copy is not supported on this platform".to_string())
 }

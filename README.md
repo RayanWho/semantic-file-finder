@@ -36,7 +36,7 @@
 | **前端** | React 18 + TypeScript + TailwindCSS | UI 渲染 |
 | **后端核心** | Rust | 文件系统、数据库、进程管理 |
 | **ML Worker** | Python + ONNX | bge-m3 嵌入模型 |
-| **向量索引** | FAISS | 本地向量相似度检索 |
+| **向量索引** | USearch | 本地向量相似度检索 |
 | **文件解析** | Python (PyMuPDF, python-docx 等) | 多格式文件解析 |
 
 ## 🚀 快速开始

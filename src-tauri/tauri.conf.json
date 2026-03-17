@@ -3,10 +3,14 @@
   "productName": "Semantic File Finder",
   "version": "0.1.0",
   "identifier": "com.semantic-file-finder.app",
-  "buildUrl": "http://localhost:1420",
-  "frontendDist": "../dist",
-  "withGlobalTauri": true,
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Semantic File Finder",
@@ -27,43 +31,15 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "msi", "deb", "rpm"],
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
-    "resources": {
-      "python-workers": "./python-workers",
-      "models": "./models"
-    },
-    "windows": {
-      "wix": {
-        "language": ["zh-CN", "en-US"]
-      },
-      "nsis": {
-        "languages": ["English", "Chinese (Simplified)"]
-      }
-    },
+    "targets": ["app", "dmg"],
+    "icon": [],
     "macOS": {
-      "minimumSystemVersion": "10.15",
-      "universal": true,
-      "signingIdentity": null,
-      "notarize": false
+      "minimumSystemVersion": "10.15"
     },
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.0-37", "libgtk-3-0"]
       }
     }
-  },
-  "plugins": {
-    "fs": {
-      "scope": ["**"]
-    },
-    "dialog": {},
-    "notification": {}
   }
 }
